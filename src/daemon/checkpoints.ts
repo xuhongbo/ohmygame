@@ -55,16 +55,34 @@ export class CheckpointStore {
     return this.#serialize(project, () => this.#snapshot(project));
   }
 
-  /** Puts the workspace back to a snapshot. Only paths that differ are written or removed. */
+  /**
+   * Puts the workspace back to a snapshot. Only paths that differ are written
+   * or removed. When that fails part way, the paths already changed are put
+   * back as they were.
+   */
   restore(project: CheckpointProject, commit: string): Promise<CheckpointRestoreResult> {
     return this.#serialize(project, async () => {
       const gitdir = checkpointDirectory(project);
       const undo = await this.#snapshot(project);
       const [current, target] = await Promise.all([this.#treeOf(gitdir, undo), this.#treeOf(gitdir, commit)]);
-      const changes: Change[] = [];
-      await this.#diff(gitdir, current, target, "", changes);
-      const cache = await readStatCache(gitdir);
-      const workspace = project.workspacePath;
+      try {
+        return { undo, changed: await this.#apply(project, current, target) };
+      } catch (cause) {
+        const partial = await this.#snapshot(project).then((oid) => this.#treeOf(gitdir, oid));
+        await this.#apply(project, partial, current).catch(() => {});
+        throw cause;
+      }
+    });
+  }
+
+  /** Changes the workspace from one tree to another and returns the paths it wrote or removed. */
+  async #apply(project: CheckpointProject, from: string, to: string): Promise<string[]> {
+    const gitdir = checkpointDirectory(project);
+    const workspace = project.workspacePath;
+    const changes: Change[] = [];
+    await this.#diff(gitdir, from, to, "", changes);
+    const cache = await readStatCache(gitdir);
+    try {
       // Removals go first so a file can take the place of a folder and the other way round.
       for (const change of changes) {
         if (change.to) continue;
@@ -74,21 +92,22 @@ export class CheckpointStore {
       }
       await mapLimit(changes.filter((change) => change.to), FILE_CONCURRENCY, async (change) => {
         const { oid, mode } = change.to!;
-        const target = path.join(workspace, change.path);
-        await mkdir(path.dirname(target), { recursive: true });
+        const file = path.join(workspace, change.path);
+        await mkdir(path.dirname(file), { recursive: true });
         const content = (await git.readBlob({ fs, gitdir, oid })).blob;
-        await rm(target, { force: true });
-        if (mode === "120000") await symlink(Buffer.from(content).toString("utf8"), target);
+        await rm(file, { force: true });
+        if (mode === "120000") await symlink(Buffer.from(content).toString("utf8"), file);
         else {
-          await writeFile(target, content);
-          await chmod(target, mode === "100755" ? 0o755 : 0o644);
+          await writeFile(file, content);
+          await chmod(file, mode === "100755" ? 0o755 : 0o644);
         }
-        const stats = await lstat(target);
+        const stats = await lstat(file);
         cache[change.path] = { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, mode, oid };
       });
+    } finally {
       await writeStatCache(gitdir, cache);
-      return { undo, changed: changes.map((change) => change.path) };
-    });
+    }
+    return changes.map((change) => change.path);
   }
 
   async #snapshot(project: CheckpointProject): Promise<string> {
