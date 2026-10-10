@@ -1,5 +1,5 @@
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -180,6 +180,61 @@ describe("Agent checkpoints", () => {
     expect(messages.map((message) => message.text)).toEqual(["Write the notes", "Change the notes"]);
     expect((await restore(messages[1]!.checkpointId!)).statusCode).toBe(204);
     expect(await file("notes.txt")).toBe("first");
+  });
+
+  it("takes a checkpoint for a message that was steered into a running turn", async () => {
+    const { app, base, userMessages, send, file, restore } = await studio([
+      { write: { "notes.txt": "first" } },
+      { say: "Wrote the notes.", delayMs: 400 },
+      { write: { "notes.txt": "second" } },
+      { say: "Changed the notes." },
+    ]);
+    await send("Write the notes");
+    await vi.waitFor(async () => expect(await file("notes.txt")).toBe("first"), { timeout: 15_000 });
+    const queued = await send("Change the notes");
+    expect(queued.queued).toBe(true);
+    expect((await app.inject({ method: "POST", url: `${base}/queue/${queued.turnId}/steer` })).statusCode).toBe(204);
+    await vi.waitFor(async () => expect(await file("notes.txt")).toBe("second"), { timeout: 15_000 });
+    await vi.waitFor(async () => expect((await (await app.inject({ method: "GET", url: base })).json()).agent).toMatchObject({ status: "idle" }), { timeout: 15_000 });
+
+    const messages = await userMessages();
+    expect(messages.map((message) => message.text)).toEqual(["Write the notes", "Change the notes"]);
+    expect((await restore(messages[1]!.checkpointId!)).statusCode).toBe(204);
+    expect(await file("notes.txt")).toBe("first");
+  });
+
+  it("lets the turn run without a checkpoint when the snapshot fails", async () => {
+    const { project, userMessages, send, idle, file } = await studio([
+      { write: { "notes.txt": "first" } },
+      { say: "Wrote the notes." },
+    ]);
+    // A file where the checkpoint store belongs makes every snapshot fail.
+    await writeFile(path.join(path.dirname(project.workspacePath), "checkpoints"), "not a folder");
+    await send("Write the notes");
+    await idle(1);
+    expect(await file("notes.txt")).toBe("first");
+    const [message] = await userMessages();
+    expect(message).toMatchObject({ text: "Write the notes" });
+    expect(message!.checkpointId).toBeUndefined();
+  });
+
+  it("restores an Interactive Story project", async () => {
+    const { project, userMessages, send, idle, file, missing, restore } = await studio([
+      { write: { "nodes/intro/index.html": "<main>changed by the Agent</main>", "notes.txt": "first" } },
+      { say: "Changed the intro." },
+    ], "interactive-story");
+    const graph = await file("graph.json");
+    await mkdir(path.join(project.workspacePath, "nodes/intro"), { recursive: true });
+    await writeFile(path.join(project.workspacePath, "nodes/intro/index.html"), "<main>written by the author</main>");
+    await send("Change the intro");
+    await idle(1);
+    expect(await file("nodes/intro/index.html")).toBe("<main>changed by the Agent</main>");
+
+    const [message] = await userMessages();
+    expect((await restore(message!.checkpointId!)).statusCode).toBe(204);
+    expect(await missing("notes.txt")).toBe(true);
+    expect(await file("graph.json")).toBe(graph);
+    expect(await file("nodes/intro/index.html")).toBe("<main>written by the author</main>");
   });
 
   it("refuses to restore while the Agent is working and for checkpoints it does not have", async () => {
