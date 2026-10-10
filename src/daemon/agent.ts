@@ -32,6 +32,7 @@ import type { PluginMcpHost } from "./plugin-mcp-host.js";
 import { projectProcessEnvironment } from "./project-process.js";
 import { createProviderImageReadTool, installDeepSeekImageFiles } from "./deepseek-image-files.js";
 import { AGENT_ERROR_ENTRY, assistantMessageError, normalizeAgentError, thrownAgentError } from "./agent-errors.js";
+import { CHECKPOINT_ENTRY, CHECKPOINT_RESTORED_ENTRY, parseStoredCheckpoint } from "./checkpoint-extension.js";
 
 export interface CodingSession {
   readonly messages: readonly unknown[];
@@ -54,6 +55,13 @@ export interface CodingSession {
   setActiveToolsByName?(toolNames: string[]): void;
   getAllTools?(): Array<{ name: string }>;
   getSkills?(): SkillCatalogItem[];
+}
+
+/** The conversation has no such checkpoint on its current branch. */
+export class CheckpointNotFoundError extends Error {
+  constructor() {
+    super("Checkpoint not found");
+  }
 }
 
 export interface SkillCatalogItem {
@@ -102,6 +110,7 @@ export function conversationItems(entries: readonly SessionEntry[], markInterrup
   let turnFinished = true;
   let lastTimestamp: number | undefined;
   let storedPrompt: StoredPromptDetails | undefined;
+  let checkpointId: string | undefined;
 
   for (const entry of entries) {
     if (entry.type === "compaction") {
@@ -134,6 +143,16 @@ export function conversationItems(entries: readonly SessionEntry[], markInterrup
       storedPrompt = parseStoredPromptDetails(entry.data);
       continue;
     }
+    if (entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY) {
+      // The snapshot was taken just before the user message that follows.
+      checkpointId = parseStoredCheckpoint(entry.data) ? entry.id : undefined;
+      continue;
+    }
+    if (entry.type === "custom" && entry.customType === CHECKPOINT_RESTORED_ENTRY) {
+      // The message that checkpoint belonged to is no longer on this branch.
+      checkpointId = undefined;
+      continue;
+    }
     if (entry.type === "custom" && entry.customType === AGENT_ERROR_ENTRY) {
       const data = record(entry.data);
       const storedError = record(data?.error);
@@ -141,6 +160,7 @@ export function conversationItems(entries: readonly SessionEntry[], markInterrup
       if (data.beforeUserMessage === true) {
         turnId = entry.id;
         storedPrompt = undefined;
+        checkpointId = undefined;
       } else turnId ??= entry.id;
       const error = normalizeAgentError(storedError.message, storedError.diagnostics);
       const previous = items.findLastIndex((item) => item.turnId === turnId && item.type === "agentMessage");
@@ -160,13 +180,15 @@ export function conversationItems(entries: readonly SessionEntry[], markInterrup
       const parsed = parseUserPrompt(textContent(message.content));
       const details = storedPrompt?.wirePromptHash === promptHash(textContent(message.content)) ? storedPrompt : undefined;
       storedPrompt = undefined;
+      const checkpoint = checkpointId;
+      checkpointId = undefined;
       const images = imageContent(message.content);
       const text = details?.prompt ?? parsed.text;
       const mentions = details?.mentions ?? parsed.mentions;
       const attachments = details?.attachments ?? parsed.attachments;
       const contexts = promptContextLabels(details?.attachmentContext ?? parsed.attachmentContext);
       if (text || images.length > 0 || attachments.length > 0) {
-        items.push({ id: entry.id, turnId, type: "userMessage", text, ...(mentions.length ? { mentions } : {}), ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(contexts.length ? { contexts } : {}), timestamp });
+        items.push({ id: entry.id, turnId, type: "userMessage", text, ...(mentions.length ? { mentions } : {}), ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(contexts.length ? { contexts } : {}), ...(checkpoint ? { checkpointId: checkpoint } : {}), timestamp });
         if (images.length) items.push({ id: `${entry.id}:images`, turnId, type: "imageRead", count: images.length, status: "completed", timestamp });
       }
       continue;
@@ -334,6 +356,8 @@ interface ActiveTurn {
   projectId: string;
   conversationId: string;
   turnId: string;
+  /** The checkpoint taken before the user message of this turn, once there is one. */
+  checkpointId?: string;
   prompt: string;
   mentions: PluginMention[];
   images: PromptImage[];
@@ -670,6 +694,56 @@ export class AgentManager {
     } catch (cause) {
       if (navigated && !this.#activeTurns.has(key)) this.#forgetConversation(key);
       throw cause;
+    } finally {
+      this.#revisions.delete(key);
+      this.#flushInvalidatedProject(project.id);
+    }
+  }
+
+  /**
+   * Puts the workspace and the conversation back to just before the user
+   * message a checkpoint was taken for. `restoreFiles` restores the workspace
+   * to a snapshot and returns a snapshot of what it replaced.
+   */
+  async restoreCheckpoint(
+    project: ProjectState,
+    conversation: StoredConversation,
+    checkpointId: string,
+    restoreFiles: (commit: string) => Promise<string>,
+  ): Promise<void> {
+    if (this.#closing) throw new Error("Agent manager is closing");
+    const key = conversationKey(project.id, conversation.summary.id);
+    if (this.planState(conversation).mode !== "normal") throw new Error("Finish or cancel the current plan before restoring");
+    // Any conversation of the project may be changing the same workspace.
+    if (this.isProjectBusy(project.id)) throw new Error("Wait for the agent to finish before restoring");
+    if ((this.#pendingPrompts.get(key)?.length ?? 0) > 0 || (this.#steeringPrompts.get(key)?.length ?? 0) > 0) {
+      throw new Error("Remove queued messages before restoring");
+    }
+
+    this.#revisions.add(key);
+    try {
+      const { session } = await this.#getSession(project, conversation);
+      const sessionManager = session.sessionManager;
+      if (!session.navigateTree || !sessionManager) throw new Error("The current agent session cannot restore checkpoints");
+      const branch = sessionManager.getBranch();
+      const index = branch.findIndex((entry) => entry.id === checkpointId);
+      const entry = branch[index];
+      const checkpoint = entry?.type === "custom" && entry.customType === CHECKPOINT_ENTRY ? parseStoredCheckpoint(entry.data) : undefined;
+      const message = checkpoint && branch.slice(index + 1).find((candidate) => candidate.type === "message" && candidate.message.role === "user");
+      if (!checkpoint || !message) throw new CheckpointNotFoundError();
+
+      const undo = await restoreFiles(checkpoint.commit);
+      try {
+        const navigation = await session.navigateTree(message.id, { summarize: false });
+        if (navigation.cancelled) throw new Error("Restore was cancelled");
+        // Pi moves back in memory only; an entry after the move makes it the conversation's end on disk too.
+        sessionManager.appendCustomEntry(CHECKPOINT_RESTORED_ENTRY, { version: 1, checkpoint: checkpointId, undo });
+        appendPlanState(sessionManager, { mode: "normal" });
+      } catch (cause) {
+        await restoreFiles(undo).catch(() => {});
+        this.#forgetConversation(key);
+        throw cause;
+      }
     } finally {
       this.#revisions.delete(key);
       this.#flushInvalidatedProject(project.id);
@@ -1029,6 +1103,7 @@ export class AgentManager {
       ...(active.images.length ? { images: active.images } : {}),
       ...(active.attachments.length ? { attachments: active.attachments } : {}),
       ...(contexts.length ? { contexts } : {}),
+      ...(active.checkpointId ? { checkpointId: active.checkpointId } : {}),
       ...timestamp,
     }, ...(active.images.length ? [{
       id: `${active.turnId}:images`,
@@ -1200,6 +1275,7 @@ export class AgentManager {
       if (active.images.length && active.startedEventId !== undefined) this.events.expireThrough(projectId, active.startedEventId);
       if (started.images.length) this.events.expireThrough(projectId, started.queuedEventId);
       active.turnId = started.turnId;
+      active.checkpointId = undefined;
       active.prompt = started.prompt;
       active.mentions = started.mentions;
       active.images = started.images;
@@ -1325,6 +1401,13 @@ export class AgentManager {
       active.toolItemIds.set(toolCall.id, itemId);
       const args = toolArguments(toolCall.name, toolCall.arguments);
       this.#updateItem(projectId, active, toolThreadItem(active.turnId, itemId, toolCall.id, toolCall.name, args, "preparing"));
+    } else if (event.type === "message_end" && isUserMessage(event.message)) {
+      // The checkpoint extension has run by now and Pi has not stored the message yet, so the entry is the last one.
+      const entry = this.#sessions.get(conversationKey(projectId, conversationId))?.session.sessionManager?.getBranch().at(-1);
+      if (entry?.type === "custom" && entry.customType === CHECKPOINT_ENTRY && parseStoredCheckpoint(entry.data)) {
+        active.checkpointId = entry.id;
+        this.events.publish(projectId, "checkpoint.created", { checkpointId: entry.id }, eventScope(active));
+      }
     } else if (event.type === "message_end" && isAssistantMessage(event.message)) {
       const status = threadItemStatus(event.message.stopReason);
       active.lastError = event.message.stopReason === "error" ? this.#turnError(active, assistantMessageError(event.message)) : undefined;
@@ -2203,12 +2286,14 @@ export async function createPiSession(
   agentDir = process.env.PI_CODING_AGENT_DIR ?? path.resolve(process.cwd(), ".data", "pi-agent"),
   resolvePluginSkills?: () => Promise<PluginSkillRegistration[]>,
   mcp?: { factory: ExtensionFactory; host: PluginMcpHost },
+  checkpointFactory?: ExtensionFactory,
 ): Promise<CodingSession> {
   // Trusted-local phase: cwd guides Pi but is not an OS security boundary.
   const { resourceLoader, sessionSettings, pluginSkills } = await createPiResourceLoader(project.workspacePath, agentDir, {
     resolvePluginSkills,
     appendSystemPrompt: appendSystemPromptForProject(project),
     mcpFactory: mcp?.factory,
+    checkpointFactory,
   });
   const { session } = await createAgentSession({
     cwd: project.workspacePath,
@@ -2263,6 +2348,7 @@ async function createPiResourceLoader(
     resolvePluginSkills?: () => Promise<PluginSkillRegistration[]>;
     appendSystemPrompt?: readonly string[];
     mcpFactory?: ExtensionFactory;
+    checkpointFactory?: ExtensionFactory;
   } = {},
 ): Promise<{ resourceLoader: DefaultResourceLoader; sessionSettings: SettingsManager; pluginSkills: PluginSkillRegistration[] }> {
   await ensureOhMyGamePiEnvironment(agentDir);
@@ -2279,6 +2365,7 @@ async function createPiResourceLoader(
     agentDir,
     settingsManager: sessionSettings,
     extensionFactories: [{ name: "openrouter-attribution", factory: openRouterAttributionExtension, hidden: true },
+      ...(options.checkpointFactory ? [{ name: "checkpoints", factory: options.checkpointFactory, hidden: true }] : []),
       ...(options.mcpFactory ? [{ name: "plugin-mcp", factory: options.mcpFactory, hidden: true }] : [])],
     additionalSkillPaths: pluginSkills.map((skill) => skill.path),
     appendSystemPrompt: options.appendSystemPrompt

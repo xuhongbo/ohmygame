@@ -582,7 +582,7 @@ export interface PlanState {
 }
 
 export type ThreadItem = (
-  | { id: string; turnId: string; type: "userMessage"; text: string; mentions?: PluginMention[]; images?: PromptImage[]; attachments?: ConversationAttachment[]; contexts?: PromptContextLabel[] }
+  | { id: string; turnId: string; type: "userMessage"; text: string; mentions?: PluginMention[]; images?: PromptImage[]; attachments?: ConversationAttachment[]; contexts?: PromptContextLabel[]; /** The workspace as it was before this message, when it can be restored. */ checkpointId?: string }
   | { id: string; turnId: string; type: "imageRead"; count: number; status: "completed" }
   | { id: string; turnId: string; type: "modelChange"; model: AgentModelRef; name?: string }
   | {
@@ -997,6 +997,8 @@ export interface RuntimeEventData {
   "preview.error": { error: string };
   "preview.stopped": Record<string, never>;
   "agent.started": { prompt: string; mentions?: PluginMention[]; images?: PromptImage[]; attachments?: ConversationAttachment[]; contexts?: PromptContextLabel[]; revision?: "last-turn" };
+  "checkpoint.created": { checkpointId: string };
+  "workspace.restored": { checkpointId: string };
   "plan.mode.changed": PlanSessionState;
   "item.started": { item: ThreadItem };
   "item.updated": { item: ThreadItem };
@@ -1026,6 +1028,8 @@ export const RUNTIME_EVENT_TYPES = [
   "preview.error",
   "preview.stopped",
   "agent.started",
+  "checkpoint.created",
+  "workspace.restored",
   "item.started",
   "item.updated",
   "item.completed",

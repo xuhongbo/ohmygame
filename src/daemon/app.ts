@@ -18,7 +18,9 @@ import { EXAMPLE_ID_PATTERN } from "../shared/examples.js";
 import { PUBLISH_GAME_TITLE_MAX_LENGTH } from "../shared/publish-v1.js";
 import { clampReasoningLevel, parseReasoningLevel, supportedReasoningLevels } from "../shared/reasoning.js";
 import { matchesBearerToken } from "./access.js";
-import { AgentManager, conversationItems, createPiSession, loadPiSkillCatalog, loadPiSkills, type RuntimeModel, type SessionFactory } from "./agent.js";
+import { AgentManager, CheckpointNotFoundError, conversationItems, createPiSession, loadPiSkillCatalog, loadPiSkills, type RuntimeModel, type SessionFactory } from "./agent.js";
+import { checkpointExtension } from "./checkpoint-extension.js";
+import { CheckpointStore } from "./checkpoints.js";
 import { createAgentTools, projectPiToolNames } from "./agent-tools.js";
 import { ConversationManager, type StoredConversation } from "./conversations.js";
 import { ConversationImageStore } from "./conversation-images.js";
@@ -519,6 +521,7 @@ export function createApp(options: AppOptions = {}) {
     fetch: options.publishFetch,
   });
   const previews = new PreviewManager(events);
+  const checkpoints = new CheckpointStore();
   const webSearchSettings = new WebSearchSettingsStore(dataDirectory);
   const networkSettings = options.networkSettings ?? new NetworkSettingsService(dataDirectory);
   const meshySettings = new MediaProviderKeyStore(dataDirectory, "meshy", "Meshy");
@@ -722,6 +725,7 @@ export function createApp(options: AppOptions = {}) {
         piAgentDirectory,
         () => resolvePluginSkills([bundledPlugins, localPlugins], pluginSettings, project.type),
         Object.keys(effectiveMcp.mcpServers).length ? { factory: await pluginCapabilities.host.extension(effectiveMcp), host: pluginCapabilities.host } : undefined,
+        supportsCheckpoints(project) ? checkpointExtension(() => checkpoints.snapshot(project)) : undefined,
       );
     }),
     activeToolNames: (project, mode, session) => {
@@ -2766,6 +2770,30 @@ export function createApp(options: AppOptions = {}) {
     },
   );
 
+  app.post<{ Params: { projectId: string; conversationId: string; checkpointId: string } }>(
+    "/projects/:projectId/conversations/:conversationId/checkpoints/:checkpointId/restore",
+    async (request, reply) => {
+      const project = projects.get(request.params.projectId);
+      if (!project) return reply.code(404).send({ error: "Project not found" });
+      const conversation = await conversations.get(project, request.params.conversationId);
+      if (!conversation) return reply.code(404).send({ error: "Conversation not found" });
+      if (!supportsCheckpoints(project)) return reply.code(404).send({ error: "Checkpoint not found" });
+      const { checkpointId } = request.params;
+      try {
+        await agents.restoreCheckpoint(project, conversation, checkpointId, async (commit) => (await checkpoints.restore(project, commit)).undo);
+      } catch (cause) {
+        if (cause instanceof CheckpointNotFoundError) return reply.code(404).send({ error: cause.message });
+        return reply.code(409).send({ error: cause instanceof Error ? cause.message : String(cause) });
+      }
+      // A running game serves the files it started with; the next preview starts from the restored ones.
+      await previews.stop(project);
+      await projects.refreshPreviewReadiness(project.id);
+      await projects.touch(project.id);
+      events.publish(project.id, "workspace.restored", { checkpointId }, { conversationId: conversation.summary.id });
+      return reply.code(204).send();
+    },
+  );
+
   app.delete<{ Params: { projectId: string; conversationId: string; turnId: string } }>(
     "/projects/:projectId/conversations/:conversationId/queue/:turnId",
     async (request, reply) => {
@@ -3066,4 +3094,9 @@ function configuredDefaultModel(cwd: string, agentDir: string): AgentModelRef | 
   const provider = settings.getDefaultProvider();
   const id = settings.getDefaultModel();
   return provider && id ? { provider, id } : undefined;
+}
+
+/** Projects whose work is files in the workspace; a Canvas also changes the shared Library and generation history. */
+function supportsCheckpoints(project: Pick<ProjectState, "type">): boolean {
+  return project.type === "web-game" || project.type === "general" || project.type === "interactive-story";
 }
