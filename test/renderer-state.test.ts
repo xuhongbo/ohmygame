@@ -102,6 +102,20 @@ describe("rendererReducer", () => {
     expect(next.turns.at(-1)?.items[0]).toMatchObject({ type: "userMessage", text: "Revised" });
   });
 
+  it("marks the user message of a turn with the checkpoint taken for it", () => {
+    const state = { ...initialized(), lastEventId: 1, turns: [
+      turn("turn-1", "completed", [user("turn-1", "First")]),
+      turn("turn-2", "inProgress", [user("turn-2", "Second")]),
+    ] };
+    const next = event(state, { ...runtimeEvent(2, "checkpoint.created", { checkpointId: "checkpoint-2" }), conversationId: "conversation-1", turnId: "turn-2" });
+
+    expect(next.turns[0]?.items[0]).not.toHaveProperty("checkpointId");
+    expect(next.turns[1]?.items[0]).toMatchObject({ type: "userMessage", text: "Second", checkpointId: "checkpoint-2" });
+    // An event of another conversation changes nothing.
+    const other = event(state, { ...runtimeEvent(2, "checkpoint.created", { checkpointId: "checkpoint-9" }), turnId: "turn-2", conversationId: "another" });
+    expect(other.turns[1]?.items[0]).not.toHaveProperty("checkpointId");
+  });
+
   it("removes a transient retry item after reconnection succeeds", () => {
     let state = initialized();
     state = event(state, runtimeEvent(1, "agent.started", { prompt: "Build" }));

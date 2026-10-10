@@ -38,6 +38,7 @@ import {
   publishProject,
   removePendingPrompt,
   renameConversation,
+  restoreCheckpoint,
   reviseLastPrompt,
   refinePlan,
   sendPrompt,
@@ -221,6 +222,15 @@ export function ProjectShell({
       onEvent: (event) => {
         dispatch({ type: "runtime-event", event });
         if (event.type === "agent.completed") setWorkspaceRevision((value) => value + 1);
+        if (event.type === "workspace.restored") {
+          // Files changed under every editor, and the restored conversation lost its later messages.
+          setWorkspaceRevision((value) => value + 1);
+          if (event.conversationId === selectedConversationId) {
+            void getConversation(projectId, selectedConversationId, true)
+              .then((detail) => dispatch({ type: "conversation-loaded", detail }))
+              .catch(() => {});
+          }
+        }
         if (event.type === "conversation.renamed") {
           setConversations((current) => current.map((conversation) =>
             conversation.id === event.data.conversation.id ? event.data.conversation : conversation));
@@ -543,6 +553,20 @@ export function ProjectShell({
     }
   }, [project, conversation, agentBusy, state.pendingPrompts.length, state.connection]);
 
+  const restoreToMessage = useCallback((checkpointId: string) => {
+    if (!project || !conversation || agentBusy || state.pendingPrompts.length > 0 || state.connection !== "open") return;
+    if (!window.confirm("Restore the project to before this message?\n\nEvery file change made since then, including your own, and the messages after it will be removed.")) return;
+    dispatch({ type: "notice", message: undefined });
+    void (async () => {
+      try {
+        await saveDesign.current?.();
+        await restoreCheckpoint(project.id, conversation.id, checkpointId);
+      } catch (error) {
+        dispatch({ type: "notice", message: errorMessage(error) });
+      }
+    })();
+  }, [project, conversation, agentBusy, state.pendingPrompts.length, state.connection]);
+
   async function stopAgent() {
     const turnId = activeTurn?.id;
     if (!project || !conversation || !turnId || !currentConversationBusy) return;
@@ -788,6 +812,7 @@ export function ProjectShell({
                 revisionDisabled={agentBusy || state.plan.mode !== "normal" || state.pendingPrompts.length > 0 || state.connection !== "open"}
                 waitingForInput={Boolean(questionnaire)}
                 onRevise={revisePrompt}
+                onRestore={restoreToMessage}
                 onAddToChat={addToChat}
               />
             </Activity>

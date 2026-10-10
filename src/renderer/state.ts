@@ -73,7 +73,7 @@ export function reduceRuntimeEvent(state: RendererState, event: RuntimeEvent): R
   const next = { ...state, lastEventId: event.id, notice: undefined };
   const project = state.project;
   const conversation = state.conversation;
-  const conversationScopedEvent = event.type.startsWith("agent.") || event.type.startsWith("item.") || event.type.startsWith("plan.") || event.type.startsWith("prompt.") || event.type === "conversation.model.changed";
+  const conversationScopedEvent = event.type.startsWith("agent.") || event.type.startsWith("item.") || event.type.startsWith("plan.") || event.type.startsWith("prompt.") || event.type === "conversation.model.changed" || event.type === "checkpoint.created";
   if (conversationScopedEvent && (!conversation || event.conversationId !== conversation.id)) return next;
 
   switch (event.type) {
@@ -91,6 +91,14 @@ export function reduceRuntimeEvent(state: RendererState, event: RuntimeEvent): R
           status: "completed",
           items: [{ ...event.data.item, timestamp: eventTime(event) }],
         }],
+      };
+    case "checkpoint.created":
+      return {
+        ...next,
+        turns: state.turns.map((turn) => turn.id !== event.turnId ? turn : {
+          ...turn,
+          items: turn.items.map((item) => item.type === "userMessage" ? { ...item, checkpointId: event.data.checkpointId } : item),
+        }),
       };
     case "project.renamed":
     case "project.updated":

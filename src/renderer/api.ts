@@ -809,6 +809,11 @@ export async function reviseLastPrompt(
   });
 }
 
+/** Puts the workspace and the conversation back to just before the message the checkpoint was taken for. */
+export async function restoreCheckpoint(projectId: string, conversationId: string, checkpointId: string): Promise<void> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/checkpoints/${encodeURIComponent(checkpointId)}/restore`, { method: "POST" });
+}
+
 export async function removePendingPrompt(projectId: string, conversationId: string, turnId: string): Promise<void> {
   await request(`/projects/${projectId}/conversations/${conversationId}/queue/${turnId}`, { method: "DELETE" });
 }
