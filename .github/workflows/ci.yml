@@ -6,6 +6,7 @@ on:
     branches:
       - dev
       - main
+      - tmp/ci-verify
 
 concurrency:
   group: ci-${{ github.ref }}
