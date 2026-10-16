@@ -13,7 +13,11 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,9 +27,11 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
-      - run: bun run changelog:check
+      - if: runner.os == 'Linux'
+        run: bun run changelog:check
       - run: bun run prepare:preinstalled-plugins
       - run: bun run typecheck
       - run: bun run test
-      - run: bun run build:renderer
+      - if: runner.os == 'Linux'
+        run: bun run build:renderer
       - run: bun run test:node-runtime
